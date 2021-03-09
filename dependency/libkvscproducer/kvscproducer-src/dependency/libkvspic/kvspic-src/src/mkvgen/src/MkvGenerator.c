@@ -1135,6 +1135,18 @@ STATUS mkvgenEbmlEncodeTrackInfo(PBYTE pBuffer, UINT32 bufferSize, PStreamMkvGen
         // Fix-up the track type
         *(pTrackStart + MKV_TRACK_TYPE_OFFSET) = (BYTE) pTrackInfo->trackType;
 
+        // Package track frame rate IFF video track
+        if (GENERATE_VIDEO_CONFIG(&pMkvGenerator->trackInfoList[j]))  {
+            MEMCPY(pTrackStart + trackSpecificDataOffset, MKV_TRACK_FRAME_RATE_BITS, MKV_TRACK_FRAME_RATE_BITS_SIZE);
+            mkvTrackDataSize += MKV_TRACK_FRAME_RATE_BITS_SIZE;
+        
+            // Fix-up the frame rate
+            PUT_UNALIGNED_BIG_ENDIAN((PINT32)(pTrackStart + trackSpecificDataOffset + MKV_TRACK_FRAME_RATE_OFFSET),
+                                    33333333); // For now, hardcode to 30fps (value is 1 frame @ 30 FPS in nanoseconds)
+
+            trackSpecificDataOffset += MKV_TRACK_FRAME_RATE_BITS_SIZE;
+        }
+
         // Package track name
         trackNameDataSize = (UINT32) STRNLEN(pTrackInfo->trackName, MKV_MAX_TRACK_NAME_LEN);
         if (trackNameDataSize > 0) {
@@ -1185,6 +1197,7 @@ STATUS mkvgenEbmlEncodeTrackInfo(PBYTE pBuffer, UINT32 bufferSize, PStreamMkvGen
             // Fix-up the width and height
             PUT_UNALIGNED_BIG_ENDIAN((PINT16)(pTrackStart + trackSpecificDataOffset + MKV_TRACK_VIDEO_WIDTH_OFFSET),
                                      pTrackInfo->trackCustomData.trackVideoConfig.videoWidth);
+                                     
             PUT_UNALIGNED_BIG_ENDIAN((PINT16)(pTrackStart + trackSpecificDataOffset + MKV_TRACK_VIDEO_HEIGHT_OFFSET),
                                      pTrackInfo->trackCustomData.trackVideoConfig.videoHeight);
 
@@ -1421,10 +1434,12 @@ UINT32 mkvgenGetTrackEntrySize(PTrackInfo pTrackInfo)
         trackEntrySize += MKV_TRACK_NAME_BITS_SIZE + encodedLen + dataSize;
     }
 
+    
+
     if (GENERATE_AUDIO_CONFIG(pTrackInfo)) {
         trackEntrySize += mkvgenGetMkvAudioBitsSize(pTrackInfo);
     } else if (GENERATE_VIDEO_CONFIG(pTrackInfo)) {
-        trackEntrySize += MKV_TRACK_VIDEO_BITS_SIZE;
+        trackEntrySize += MKV_TRACK_VIDEO_BITS_SIZE + MKV_TRACK_FRAME_RATE_BITS_SIZE;
     }
 
     return trackEntrySize;

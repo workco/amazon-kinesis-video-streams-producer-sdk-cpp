@@ -105,6 +105,8 @@ extern BYTE gMkvCodecIdBits[];
 extern UINT32 gMkvCodecIdBitsSize;
 extern BYTE gMkvTrackNameBits[];
 extern UINT32 gMkvTrackNameBitsSize;
+extern BYTE gMkvTrackFrameRateBits[];
+extern UINT32 gMkvTrackFrameRateBitsSize;
 #define MKV_TRACK_INFO_BITS                 gMkvTrackInfoBits
 #define MKV_TRACK_INFO_BITS_SIZE            gMkvTrackInfoBitsSize
 #define MKV_TRACKS_ELEM_BITS                gMkvTracksElem
@@ -121,6 +123,8 @@ extern UINT32 gMkvTrackNameBitsSize;
 #define MKV_CODEC_ID_BITS_SIZE              gMkvCodecIdBitsSize
 #define MKV_TRACK_NAME_BITS                 gMkvTrackNameBits
 #define MKV_TRACK_NAME_BITS_SIZE            gMkvTrackNameBitsSize
+#define MKV_TRACK_FRAME_RATE_BITS           gMkvTrackFrameRateBits
+#define MKV_TRACK_FRAME_RATE_BITS_SIZE      gMkvTrackFrameRateBitsSize
 
 // gMkvTrackInfoBits element size offset for fixing up
 #define MKV_TRACK_HEADER_SIZE_OFFSET 4
@@ -133,6 +137,9 @@ extern UINT32 gMkvTrackNameBitsSize;
 
 // gMkvTrackInfoBits track type offset for fixing up
 #define MKV_TRACK_TYPE_OFFSET 21
+
+// Track info frame rate offset for fixing up
+#define MKV_TRACK_FRAME_RATE_OFFSET 4
 
 // Track info video width offset for fixing up
 #define MKV_TRACK_VIDEO_WIDTH_OFFSET 7

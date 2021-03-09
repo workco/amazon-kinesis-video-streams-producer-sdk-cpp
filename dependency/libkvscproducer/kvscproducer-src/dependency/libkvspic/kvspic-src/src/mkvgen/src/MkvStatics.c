@@ -64,6 +64,13 @@ BYTE gMkvTrackInfoBits[] = {
 };
 UINT32 gMkvTrackInfoBitsSize = SIZEOF(gMkvTrackInfoBits);
 
+BYTE gMkvTrackFrameRateBits[] = {
+    0x23, 0xE3, 0x83, // Default Duration
+    0x84, // 4-byte size
+    0x00, 0x00, 0x00, 0x00
+};
+UINT32 gMkvTrackFrameRateBitsSize = SIZEOF(gMkvTrackFrameRateBits);
+
 BYTE gMkvCodecIdBits[] = {
     0x86, // Codec id
 };
@@ -87,7 +94,7 @@ BYTE gMkvTrackVideoBits[] = {
     0x00, 0x00,
     0xBA, // Pixel height
     0x82, // 2-byte size
-    0x00, 0x00,
+    0x00, 0x00
 };
 UINT32 gMkvTrackVideoBitsSize = SIZEOF(gMkvTrackVideoBits);
 
