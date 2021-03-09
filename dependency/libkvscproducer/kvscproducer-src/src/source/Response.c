@@ -31,7 +31,6 @@ STATUS createCurlResponse(PCurlRequest pCurlRequest, PCurlResponse* ppCurlRespon
 
     // init putMedia related members
     pCurlResponse->endOfStream = FALSE;
-    pCurlResponse->paused = TRUE;
     pCurlResponse->debugDumpFile = FALSE;
     pCurlResponse->debugDumpFilePath[0] = '\0';
 
@@ -50,6 +49,11 @@ STATUS createCurlResponse(PCurlRequest pCurlRequest, PCurlResponse* ppCurlRespon
     // Create the mutex
     pCurlResponse->lock = pCallbacksProvider->clientCallbacks.createMutexFn(pCallbacksProvider->clientCallbacks.customData, TRUE);
     CHK(pCurlResponse->lock != INVALID_MUTEX_VALUE, STATUS_INVALID_OPERATION);
+
+    pCurlResponse->dataAvailableLock = pCallbacksProvider->clientCallbacks.createMutexFn(pCallbacksProvider->clientCallbacks.customData, TRUE);
+    CHK(pCurlResponse->dataAvailableLock != INVALID_MUTEX_VALUE, STATUS_INVALID_OPERATION);
+
+    pCurlResponse->dataAvailableCvar = pCallbacksProvider->clientCallbacks.createConditionVariableFn(pCallbacksProvider->clientCallbacks.customData);
 
     // Set the parent object
     pCurlResponse->pCurlRequest = pCurlRequest;
@@ -79,7 +83,7 @@ STATUS freeCurlResponse(PCurlResponse* ppCurlResponse)
     STATUS retStatus = STATUS_SUCCESS;
     PCurlResponse pCurlResponse = NULL;
     PCallbacksProvider pCallbacksProvider = NULL;
-    BOOL locked = FALSE;
+    BOOL locked = FALSE, dataAvailableLocked = FALSE;
 
     CHK(ppCurlResponse != NULL, STATUS_NULL_ARG);
 
@@ -93,12 +97,29 @@ STATUS freeCurlResponse(PCurlResponse* ppCurlResponse)
         pCallbacksProvider = pCurlResponse->pCurlRequest->pCurlApiCallbacks->pCallbacksProvider;
     }
 
-    if (pCallbacksProvider != NULL && IS_VALID_MUTEX_VALUE(pCurlResponse->lock)) {
-        locked = pCallbacksProvider->clientCallbacks.tryLockMutexFn(pCallbacksProvider->clientCallbacks.customData, pCurlResponse->lock);
-        // if it fail to acquire the lock that means another thread is tearing down the response already.
-        // thus current thread can return early.
-        // TODO: eliminate the possibility of two threads calling freeCurlResponse.
-        CHK(locked, retStatus);
+    if (pCallbacksProvider != NULL) {
+        if (IS_VALID_MUTEX_VALUE(pCurlResponse->lock)) {
+            locked = pCallbacksProvider->clientCallbacks.tryLockMutexFn(pCallbacksProvider->clientCallbacks.customData, pCurlResponse->lock);
+            // if it fail to acquire the lock that means another thread is tearing down the response already.
+            // thus current thread can return early.
+            // TODO: eliminate the possibility of two threads calling freeCurlResponse.
+            CHK(locked, retStatus);
+        }
+        if (IS_VALID_MUTEX_VALUE(pCurlResponse->dataAvailableLock)) {
+            dataAvailableLocked = pCallbacksProvider->clientCallbacks.tryLockMutexFn(pCallbacksProvider->clientCallbacks.customData, pCurlResponse->dataAvailableLock);
+            CHK(dataAvailableLocked, retStatus);
+
+            if (dataAvailableLocked) {
+                CVAR_SIGNAL(pCurlResponse->dataAvailableCvar);
+            }
+        }
+
+        if (IS_VALID_CVAR_VALUE(pCurlResponse->dataAvailableCvar)) {
+            pCallbacksProvider->clientCallbacks.freeConditionVariableFn(pCallbacksProvider->clientCallbacks.customData,
+                                                                        pCurlResponse->dataAvailableCvar);
+            pCurlResponse->dataAvailableCvar = INVALID_CVAR_VALUE;
+        }
+
     }
 
     // Close curl handles
@@ -111,6 +132,12 @@ STATUS freeCurlResponse(PCurlResponse* ppCurlResponse)
         pCallbacksProvider->clientCallbacks.unlockMutexFn(pCallbacksProvider->clientCallbacks.customData, pCurlResponse->lock);
         pCallbacksProvider->clientCallbacks.freeMutexFn(pCallbacksProvider->clientCallbacks.customData, pCurlResponse->lock);
         locked = FALSE;
+    }
+
+    if (dataAvailableLocked) {
+        pCallbacksProvider->clientCallbacks.unlockMutexFn(pCallbacksProvider->clientCallbacks.customData, pCurlResponse->dataAvailableLock);
+        pCallbacksProvider->clientCallbacks.freeMutexFn(pCallbacksProvider->clientCallbacks.customData, pCurlResponse->dataAvailableLock);
+        dataAvailableLocked = FALSE;
     }
 
     // Release the object
@@ -272,8 +299,6 @@ VOID terminateCurlSession(PCurlResponse pCurlResponse, UINT64 timeout)
         if (!ATOMIC_LOAD_BOOL(&pCurlResponse->terminated)) {
             // give curl sometime to terminate gracefully before actually timing it out.
             THREAD_SLEEP(timeout);
-            // unpause curl in case curl is paused
-            curl_easy_pause(pCurlResponse->pCurl, CURLPAUSE_SEND_CONT);
             curl_easy_setopt(pCurlResponse->pCurl, CURLOPT_TIMEOUT_MS, TIMEOUT_AFTER_STREAM_STOPPED);
             // after timing out curl, give some time for it to take effect.
             THREAD_SLEEP(timeout);
@@ -422,6 +447,7 @@ STATUS curlCompleteSync(PCurlResponse pCurlResponse)
         pCurlResponse->callInfo.callResult = getServiceCallResultFromHttpStatus(pCurlResponse->callInfo.httpStatus);
     }
 
+
     // warn and log request/response info if there was an error return code
     if (HTTP_STATUS_CODE_OK != pCurlResponse->callInfo.httpStatus) {
         curl_easy_getinfo(pCurlResponse->pCurl, CURLINFO_EFFECTIVE_URL, &url);
@@ -435,6 +461,8 @@ STATUS curlCompleteSync(PCurlResponse pCurlResponse)
               pCurlResponse->callInfo.responseData, url, headers);
     }
 
+
+
 CleanUp:
 
     CHK_LOG_ERR(retStatus);
@@ -445,24 +473,26 @@ CleanUp:
 STATUS notifyDataAvailable(PCurlResponse pCurlResponse, UINT64 durationAvailable, UINT64 sizeAvailable)
 {
     STATUS retStatus = STATUS_SUCCESS;
-    CURLcode result;
+    PCallbacksProvider pCallbacksProvider = NULL;
 
     CHK(pCurlResponse != NULL, STATUS_NULL_ARG);
+
+
+    if (pCurlResponse->pCurlRequest != NULL && pCurlResponse->pCurlRequest->pCurlApiCallbacks != NULL &&
+        pCurlResponse->pCurlRequest->pCurlApiCallbacks->pCallbacksProvider != NULL) {
+        pCallbacksProvider = pCurlResponse->pCurlRequest->pCurlApiCallbacks->pCallbacksProvider;
+    }
 
     // pCurlResponse should be a putMedia session
     if (!ATOMIC_LOAD_BOOL(&pCurlResponse->terminated)) {
         DLOGV("Note data received: duration(100ns): %" PRIu64 " bytes %" PRIu64 " for stream handle %" PRIu64, durationAvailable, sizeAvailable,
               pCurlResponse->pCurlRequest->uploadHandle);
 
-        if (pCurlResponse->paused && pCurlResponse->pCurl != NULL) {
-            pCurlResponse->paused = FALSE;
-            // frequent pause unpause causes curl segfault in offline scenario
-            THREAD_SLEEP(10 * HUNDREDS_OF_NANOS_IN_A_MILLISECOND);
-            // un-pause curl
-            result = curl_easy_pause(pCurlResponse->pCurl, CURLPAUSE_SEND_CONT);
-            if (result != CURLE_OK) {
-                DLOGW("Failed to un-pause curl with error: %u. Curl object %p", result, pCurlResponse->pCurl);
-            }
+        if (pCurlResponse->pCurl != NULL && pCallbacksProvider != NULL) {
+            pCallbacksProvider->clientCallbacks.lockMutexFn(pCallbacksProvider->clientCallbacks.customData, pCurlResponse->dataAvailableLock);
+            ATOMIC_STORE_BOOL(&pCurlResponse->dataAvailable, TRUE);
+            CVAR_SIGNAL(pCurlResponse->dataAvailableCvar);
+            pCallbacksProvider->clientCallbacks.unlockMutexFn(pCallbacksProvider->clientCallbacks.customData, pCurlResponse->dataAvailableLock);
         }
     }
 
@@ -605,13 +635,13 @@ CleanUp:
     return dataSize;
 }
 
-SIZE_T postReadCallback(PCHAR pBuffer, SIZE_T size, SIZE_T numItems, PVOID customData)
-{
+SIZE_T postReadCallback(PCHAR pBuffer, SIZE_T size, SIZE_T numItems, PVOID customData) {
     DLOGV("postBodyStreamingReadFunc (curl callback) invoked");
     PCurlResponse pCurlResponse = NULL;
     PCurlApiCallbacks pCurlApiCallbacks;
     SIZE_T bufferSize = size * numItems, bytesWritten = 0;
     STATUS retStatus = STATUS_SUCCESS;
+    STATUS awaitStatus = STATUS_SUCCESS;
     UINT32 retrievedSize = 0;
     UPLOAD_HANDLE uploadHandle;
     PCurlRequest pCurlRequest = (PCurlRequest) customData;
@@ -625,25 +655,76 @@ SIZE_T postReadCallback(PCHAR pBuffer, SIZE_T size, SIZE_T numItems, PVOID custo
     pCurlApiCallbacks = pCurlRequest->pCurlApiCallbacks;
     uploadHandle = pCurlResponse->pCurlRequest->uploadHandle;
 
-    if (pCurlResponse->paused) {
-        bytesWritten = CURL_READFUNC_PAUSE;
-        CHK(FALSE, retStatus);
-    }
-
     if (pCurlResponse->endOfStream || ATOMIC_LOAD_BOOL(&pCurlRequest->requestInfo.terminating)) {
-        DLOGI("Closing connection for upload stream handle: %" PRIu64, uploadHandle);
+        DLOGD("Closing connection for upload stream handle: %"
+        PRIu64, uploadHandle);
         CHK(FALSE, retStatus);
     }
 
-    retStatus =
-        getKinesisVideoStreamData(pCurlResponse->pCurlRequest->streamHandle, uploadHandle, (PBYTE) pBuffer, (UINT32) bufferSize, &retrievedSize);
+    pCurlApiCallbacks->pCallbacksProvider->clientCallbacks.lockMutexFn(
+            pCurlApiCallbacks->pCallbacksProvider->clientCallbacks.customData,
+            pCurlResponse->dataAvailableLock);
 
-    if (pCurlApiCallbacks->curlReadCallbackHookFn != NULL) {
-        retStatus =
-            pCurlApiCallbacks->curlReadCallbackHookFn(pCurlResponse, uploadHandle, (PBYTE) pBuffer, (UINT32) bufferSize, &retrievedSize, retStatus);
+    while (bytesWritten == 0 && !ATOMIC_LOAD_BOOL(&pCurlResponse->dataAvailable)) {
+        awaitStatus = CVAR_WAIT(pCurlResponse->dataAvailableCvar, pCurlResponse->dataAvailableLock,
+                                DEFAULT_LOW_SPEED_TIME_LIMIT);
+        if (awaitStatus == STATUS_OPERATION_TIMED_OUT) {
+            DLOGW("Time out...");
+            retStatus = awaitStatus;
+            break;
+        } else if (!ATOMIC_LOAD_BOOL(&pCurlResponse->dataAvailable)) {
+            DLOGW("Spurious wakeup...");
+            // spurious wakeup
+            continue;
+        } else {
+            retStatus = getKinesisVideoStreamData(pCurlResponse->pCurlRequest->streamHandle, uploadHandle, (PBYTE) pBuffer,
+                                                  (UINT32) bufferSize, &retrievedSize);
+
+            if (pCurlApiCallbacks->curlReadCallbackHookFn != NULL) {
+                retStatus =
+                        pCurlApiCallbacks->curlReadCallbackHookFn(pCurlResponse, uploadHandle, (PBYTE) pBuffer,
+                                                                  (UINT32) bufferSize, &retrievedSize, retStatus);
+            }
+
+            DLOGW("Real wakeup.... bytes Written should NOT be zero");
+            bytesWritten = (SIZE_T) retrievedSize;
+
+            if (bytesWritten > 0) {
+                ATOMIC_STORE_BOOL(&pCurlResponse->dataAvailable, FALSE);
+            }
+
+            if(retStatus == STATUS_AWAITING_PERSISTED_ACK) {
+                continue;
+            } else {
+                break;
+            }
+        }
     }
 
-    bytesWritten = (SIZE_T) retrievedSize;
+
+    if (ATOMIC_LOAD_BOOL(&pCurlResponse->dataAvailable)) {
+        retStatus = getKinesisVideoStreamData(pCurlResponse->pCurlRequest->streamHandle, uploadHandle, (PBYTE) pBuffer,
+                                              (UINT32) bufferSize, &retrievedSize);
+
+        if (pCurlApiCallbacks->curlReadCallbackHookFn != NULL) {
+            retStatus =
+                    pCurlApiCallbacks->curlReadCallbackHookFn(pCurlResponse, uploadHandle, (PBYTE) pBuffer,
+                                                              (UINT32) bufferSize, &retrievedSize, retStatus);
+        }
+
+        bytesWritten = (SIZE_T) retrievedSize;
+
+        ATOMIC_STORE_BOOL(&pCurlResponse->dataAvailable, FALSE);
+    }
+
+
+
+    ATOMIC_STORE_BOOL(&pCurlResponse->dataAvailable, FALSE);
+
+    pCurlApiCallbacks->pCallbacksProvider->clientCallbacks.unlockMutexFn(
+            pCurlApiCallbacks->pCallbacksProvider->clientCallbacks.customData,
+            pCurlResponse->dataAvailableLock);
+
 
     DLOGV("Get Stream data returned: buffer size: %u written bytes: %u for upload handle: %" PRIu64 " current stream handle: %" PRIu64, bufferSize,
           bytesWritten, uploadHandle, pCurlResponse->pCurlRequest->streamHandle);
@@ -654,9 +735,11 @@ SIZE_T postReadCallback(PCHAR pBuffer, SIZE_T size, SIZE_T numItems, PVOID custo
         case STATUS_NO_MORE_DATA_AVAILABLE:
             // Media pipeline thread might be blocked due to heap or temporal limit.
             // Pause curl read and wait for persisted ack.
+            DLOGW("IN SWITCH - return status: 0x%08x, written bytes: %u .", retStatus, bytesWritten);
+
             if (bytesWritten == 0) {
-                DLOGD("Pausing CURL read for upload handle: %" PRIu64, uploadHandle);
-                bytesWritten = CURL_READFUNC_PAUSE;
+                DLOGD("Error 0 bytes after notify, aborting CURL for upload handle: %" PRIu64, uploadHandle);
+                bytesWritten = CURL_READFUNC_ABORT;
             }
             break;
 
@@ -672,8 +755,8 @@ SIZE_T postReadCallback(PCHAR pBuffer, SIZE_T size, SIZE_T numItems, PVOID custo
         case STATUS_AWAITING_PERSISTED_ACK:
             // If bytes_written == 0, set it to pause to exit the loop
             if (bytesWritten == 0) {
-                DLOGD("Pausing CURL read for upload handle: %" PRIu64 " waiting for last ack.", uploadHandle);
-                bytesWritten = CURL_READFUNC_PAUSE;
+                DLOGD("Error 0 bytes after notify, aborting CURL read for upload handle: %" PRIu64 " waiting for last ack.", uploadHandle);
+                bytesWritten = CURL_READFUNC_ABORT;
             }
             break;
 
@@ -683,6 +766,10 @@ SIZE_T postReadCallback(PCHAR pBuffer, SIZE_T size, SIZE_T numItems, PVOID custo
 
             // Graceful shutdown as PIC is aware of terminated stream
             pCurlResponse->endOfStream = TRUE;
+            break;
+        case STATUS_OPERATION_TIMED_OUT:
+            DLOGE("Error no data was received for 30s.");
+            bytesWritten = CURL_READFUNC_ABORT;
             break;
 
         default:
@@ -694,7 +781,7 @@ SIZE_T postReadCallback(PCHAR pBuffer, SIZE_T size, SIZE_T numItems, PVOID custo
 
 CleanUp:
 
-    if (bytesWritten != CURL_READFUNC_ABORT && bytesWritten != CURL_READFUNC_PAUSE) {
+    if (bytesWritten != CURL_READFUNC_ABORT) {
         DLOGD("Wrote %u bytes to Kinesis Video. Upload stream handle: %" PRIu64, bytesWritten, uploadHandle);
 
         if (bytesWritten != 0 && pCurlResponse->debugDumpFile) {
@@ -703,14 +790,14 @@ CleanUp:
                 DLOGW("Failed to write to debug dump file with error: 0x%08x", retStatus);
             }
         }
-    } else if (bytesWritten == CURL_READFUNC_PAUSE) {
-        pCurlResponse->paused = TRUE;
     }
 
     // Since curl is about to terminate gracefully, set flag to prevent shutdown thread from timing it out.
     if ((bytesWritten == CURL_READFUNC_ABORT || bytesWritten == 0) && pCurlResponse != NULL) {
         ATOMIC_STORE_BOOL(&pCurlResponse->terminated, TRUE);
     }
+
+    DLOGW("return status: 0x%08x, written bytes: %u .", retStatus, bytesWritten);
 
     return bytesWritten;
 }

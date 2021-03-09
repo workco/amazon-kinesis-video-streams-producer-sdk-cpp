@@ -16,9 +16,6 @@ extern "C" {
 // HTTP status code not set
 #define HTTP_STATUS_CODE_NOT_SET 0
 
-// Pause/unpause interval for curl
-#define CURL_PAUSE_UNPAUSE_INTERVAL (10 * HUNDREDS_OF_NANOS_IN_A_MILLISECOND)
-
 // CA file extension
 #define CA_CERT_FILE_SUFFIX ".pem"
 
@@ -56,9 +53,6 @@ struct __CurlResponse {
     // track whether end-of-stream has been received from getKinesisVideoStreamData
     BOOL endOfStream;
 
-    // Whether curl is paused
-    volatile BOOL paused;
-
     // Whether to dump streaming session into mkv file
     BOOL debugDumpFile;
 
@@ -67,6 +61,16 @@ struct __CurlResponse {
 
     // Lock for exclusive access
     MUTEX lock;
+
+    // data available lock
+    MUTEX dataAvailableLock;
+
+    // data available CVAR
+    CVAR dataAvailableCvar;
+
+    // boolean to make sure data is available
+    // needed because CVAR_WAIT could spuriously wake up
+    volatile ATOMIC_BOOL dataAvailable;
 
     ///////////////////////////////////////////////
 };
