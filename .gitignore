@@ -16,4 +16,7 @@ open-source/local
 open-source/libautoconf
 outputs
 tags
-dependency
+dependency/libkvscproducer/*
+!dependency/libkvscproducer/kvscproducer-src
+dependency/libkvscproducer/kvscproducer-src/dependency/libkvspic/*
+!dependency/libkvscproducer/kvscproducer-src/dependency/libkvspic/kvspic-src
